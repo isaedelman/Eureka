@@ -21,6 +21,7 @@ dependencies:
     - lmfit
     - matplotlib
     - nbsphinx # Needed for documentation
+    - numexpr # Needed for WFC3
     - numpy[version='>=1.20.0']
     - pandas
     - photutils
