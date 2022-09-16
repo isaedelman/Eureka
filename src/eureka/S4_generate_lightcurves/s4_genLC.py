@@ -22,6 +22,7 @@ import astraeus.xarrayIO as xrio
 from astropy.convolution import Box1DKernel
 from tqdm import tqdm
 from . import plots_s4, drift, generate_LD, wfc3
+from .data_convert import convert_to_eureka
 from ..lib import logedit
 from ..lib import readECF
 from ..lib import manageevent as me
@@ -74,20 +75,48 @@ def genlc(eventlabel, ecf_path=None, s3_meta=None):
     meta.eventlabel = eventlabel
     meta.datetime = time_pkg.strftime('%Y-%m-%d')
 
-    if s3_meta is None:
-        # Locate the old MetaClass savefile, and load new ECF into
-        # that old MetaClass
-        s3_meta, meta.inputdir, meta.inputdir_raw = \
-            me.findevent(meta, 'S3', allowFail=False)
+    # Identify the format of the data
+    if hasattr(meta, 'format'):  
+        if meta.format != 'eureka':
+            # The input data are not from Eureka, so there will not be
+            # any Stage 3 meta data
+
+            # Need to add arbitrary spec/bg_hw values
+            # This means for non-Eureka data we can only use one
+            # aperture at a time. 
+            meta.spec_hw_range = [0,]
+            meta.bg_hw_range = [0,]
+
+            # No log file
+            meta.s3_logname = None
+
+            # Define instrument this data is from
+            meta.inst = meta.data_inst
+
+            # Set photometry to False
+            # TODO: Incorporate reading of photometric Stage 3 data
+            meta.photometry = False
     else:
-        # Running these stages sequentially, so can safely assume
-        # the path hasn't changed
-        meta.inputdir = s3_meta.outputdir
-        meta.inputdir_raw = meta.inputdir[len(meta.topdir):]
+        # Set the format to Eureka (default)
+        meta.format = 'eureka'
 
-    meta = me.mergeevents(meta, s3_meta)
+    # Prep Eureka specific meta files
+    if meta.format == 'eureka':
+        # This is a Eureka reduction
+        if s3_meta is None:
+            # Locate the old MetaClass savefile, and load new ECF into
+            # that old MetaClass
+            s3_meta, meta.inputdir, meta.inputdir_raw = \
+                me.findevent(meta, 'S3', allowFail=False)
+        else:
+            # Running these stages sequentially, so can safely assume
+            # the path hasn't changed
+            meta.inputdir = s3_meta.outputdir
+            meta.inputdir_raw = meta.inputdir[len(meta.topdir):]
 
-    if not meta.allapers:
+        meta = me.mergeevents(meta, s3_meta)
+
+    if not meta.allapers and eureka_format:
         # The user indicated in the ecf that they only want to consider
         # one aperture
         meta.spec_hw_range = [meta.spec_hw, ]
@@ -108,8 +137,9 @@ def genlc(eventlabel, ecf_path=None, s3_meta=None):
             meta.spec_hw = spec_hw_val
             meta.bg_hw = bg_hw_val
 
-            # Load in the S3 metadata used for this particular aperture pair
-            meta = load_specific_s3_meta_info(meta)
+            if meta.format == 'eureka':
+                # Load in the S3 metadata used for this particular aperture pair
+                meta = load_specific_s3_meta_info(meta)
 
             # Get directory for Stage 4 processing outputs
             meta.outputdir = util.pathdirectory(meta, 'S4', meta.run_s4,
@@ -126,9 +156,16 @@ def genlc(eventlabel, ecf_path=None, s3_meta=None):
             log.writelog('Copying S4 control file', mute=(not meta.verbose))
             meta.copy_ecf()
 
-            log.writelog(f"Loading S3 save file:\n{meta.filename_S3_SpecData}",
+            # Check format and read data
+            if meta.format != 'eureka':
+                log.writelog(f"Converting non-Eureka S3 save file from:\n{meta.inputdir}",
+                    mute=(not meta.verbose))
+                # We need to convert the data and update the meta
+                meta, spec = convert_to_eureka(meta)
+            else:
+                log.writelog(f"Loading S3 save file:\n{meta.filename_S3_SpecData}",
                          mute=(not meta.verbose))
-            spec = xrio.readXR(meta.filename_S3_SpecData)
+                spec = xrio.readXR(meta.filename_S3_SpecData)
 
             wave_1d = spec.wave_1d.values
             if meta.wave_min is None:
