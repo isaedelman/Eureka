@@ -10,6 +10,7 @@ import logging
 logger = logging.getLogger("theano.tensor.opt")
 logger.setLevel(logging.ERROR)
 
+import pymc3 as pm
 import starry
 starry.config.quiet = True
 starry.config.lazy = True
@@ -50,7 +51,13 @@ class StarryModel(PyMC3Model):
         else:
             self.ydeg = 0
 
-    def setup(self):
+    def setup(self, time, flux, scatter_array, full_model):
+        self.time = time
+        self.flux = flux
+        self.scatter_array = scatter_array
+        self.full_model = full_model
+        self.linearized = self.full_model.linearized
+
         self.systems = []
         for c in range(self.nchan):
             # To save ourselves from tonnes of getattr lines, let's make a
@@ -59,6 +66,9 @@ class StarryModel(PyMC3Model):
             # `getattr(self.model, 'u1_'+c)`.
             temp = temp_class()
             for key in self.paramtitles:
+                if self.linearized and key in ['fp', 'AmpCos1', 'AmpSin1',
+                                               'AmpCos2', 'AmpSin2']:
+                    continue
                 ptype = getattr(self.parameters, key).ptype
                 if (ptype not in ['fixed', 'independent']
                         and c > 0):
@@ -69,8 +79,8 @@ class StarryModel(PyMC3Model):
                     setattr(temp, key, getattr(self.model, key))
             
             # Initialize star object
-            star = starry.Primary(starry.Map(ydeg=0, udeg=self.udeg, amp=1.0),
-                                  m=temp.Ms, r=temp.Rs, prot=1.0)
+            star = starry.Primary(starry.Map(udeg=self.udeg),
+                                  m=temp.Ms, r=temp.Rs)
 
             if hasattr(self.parameters, 'limb_dark'):
                 if self.parameters.limb_dark.value == 'kipping2013':
@@ -90,11 +100,6 @@ class StarryModel(PyMC3Model):
                                f'linear, quadratic, or kipping2013.')
                     raise ValueError(message)
             
-            if hasattr(temp, 'fp'):
-                amp = temp.fp
-            else:
-                amp = 0
-            
             # Solve Keplerian orbital period equation for Mp
             # (otherwise starry is going to mess with P or a...)
             a = temp.a*temp.Rs*const.R_sun.value
@@ -102,9 +107,17 @@ class StarryModel(PyMC3Model):
             Mp = (((2.*np.pi*a**(3./2.))/p)**2/const.G.value/const.M_sun.value
                   - temp.Ms)
 
+            if not hasattr(temp, 'fp'):
+                temp.fp = 0
+
+            if not self.linearized:
+                planet_map = starry.Map(ydeg=self.ydeg, amp=temp.fp)
+            else:
+                planet_map = starry.Map(ydeg=self.ydeg)
+
             # Initialize planet object
             planet = starry.Secondary(
-                starry.Map(ydeg=self.ydeg, udeg=0, amp=amp, inc=90.0, obl=0.0),
+                planet_map,
                 # Convert mass to M_sun units
                 # m=temp.Mp*const.M_jup.value/const.M_sun.value,
                 m=Mp,
@@ -124,21 +137,35 @@ class StarryModel(PyMC3Model):
             planet.porb = temp.per
             # Setting prot here may not override a
             planet.prot = temp.per
-            if hasattr(temp, 'AmpCos1'):
-                planet.map[1, 0] = temp.AmpCos1
-            if hasattr(temp, 'AmpSin1'):
-                planet.map[1, 1] = temp.AmpSin1
-            if self.ydeg == 2:
-                if hasattr(temp, 'AmpCos2'):
-                    planet.map[2, 0] = temp.AmpCos2
-                if hasattr(temp, 'AmpSin2'):
-                    planet.map[2, 1] = temp.AmpSin2
-            # Offset is controlled by AmpSin1
+            if not self.linearized:
+                if hasattr(temp, 'AmpCos1'):
+                    planet.map[1, 0] = temp.AmpCos1
+                if hasattr(temp, 'AmpSin1'):
+                    planet.map[1, 1] = temp.AmpSin1
+                if self.ydeg == 2:
+                    if hasattr(temp, 'AmpCos2'):
+                        planet.map[2, 0] = temp.AmpCos2
+                    if hasattr(temp, 'AmpSin2'):
+                        planet.map[2, 1] = temp.AmpSin2
+            # Offset is controlled by Y11
             planet.theta0 = 180.0
-            planet.tref = 0
+            planet.t0 = temp.t0
 
             # Instantiate the system
             sys = starry.System(star, planet)
+            
+            if self.linearized and self.ydeg > 0:
+                sys.set_data(self.flux/self.full_model.syseval(eval=False),
+                             C=self.scatter_array**2)
+
+                # Prior on map parameters
+                planet_mu = np.zeros(planet.map.Ny)
+                planet_mu[0] = 1e-4
+                planet_L = 1e-7*np.ones(planet.map.Ny)
+                planet.map.set_prior(mu=planet_mu, L=planet_L)
+
+                pm.Potential("marginal", sys.lnlike(t=self.time))
+            
             self.systems.append(sys)
 
     def eval(self, eval=True, channel=None, **kwargs):
@@ -152,15 +179,13 @@ class StarryModel(PyMC3Model):
         if eval:
             lib = np
             systems = self.fit.systems
-            t0 = self.fit.t0
         else:
             lib = tt
             systems = self.systems
-            t0 = self.model.t0
 
         phys_flux = lib.zeros(0)
         for c in channels:
-            lcpiece = systems[c].flux(self.time-t0)
+            lcpiece = systems[c].flux(self.time)
             if eval:
                 lcpiece = lcpiece.eval()
         phys_flux = lib.concatenate([phys_flux, lcpiece])
@@ -178,6 +203,9 @@ class StarryModel(PyMC3Model):
             # `getattr(self.model, 'u1_'+c)`.
             temp = temp_class()
             for key in self.paramtitles:
+                if self.linearized and key in ['fp', 'AmpCos1', 'AmpSin1',
+                                               'AmpCos2', 'AmpSin2']:
+                    continue
                 ptype = getattr(self.parameters, key).ptype
                 if (ptype not in ['fixed', 'independent']
                         and c > 0):
@@ -188,8 +216,8 @@ class StarryModel(PyMC3Model):
                     setattr(temp, key, getattr(self.fit, key))
 
             # Initialize star object
-            star = starry.Primary(starry.Map(ydeg=0, udeg=self.udeg, amp=1.0),
-                                  m=temp.Ms, r=temp.Rs, prot=1.0)
+            star = starry.Primary(starry.Map(udeg=self.udeg),
+                                  m=temp.Ms, r=temp.Rs)
 
             if hasattr(self.parameters, 'limb_dark'):
                 if self.parameters.limb_dark.value == 'kipping2013':
@@ -209,11 +237,6 @@ class StarryModel(PyMC3Model):
                                f'linear, quadratic, or kipping2013.')
                     raise ValueError(message)
             
-            if hasattr(temp, 'fp'):
-                amp = temp.fp
-            else:
-                amp = 0
-            
             # Solve Keplerian orbital period equation for Mp
             # (otherwise starry is going to mess with P or a...)
             a = temp.a*temp.Rs*const.R_sun.value
@@ -221,9 +244,17 @@ class StarryModel(PyMC3Model):
             Mp = (((2.*np.pi*a**(3./2.))/p)**2/const.G.value/const.M_sun.value
                   - temp.Ms)
 
+            if not hasattr(temp, 'fp'):
+                temp.fp = 0
+
+            if not self.linearized:
+                planet_map = starry.Map(ydeg=self.ydeg, amp=temp.fp)
+            else:
+                planet_map = starry.Map(ydeg=self.ydeg)
+
             # Initialize planet object
             planet = starry.Secondary(
-                starry.Map(ydeg=self.ydeg, udeg=0, amp=amp, inc=90.0, obl=0.0),
+                planet_map,
                 # Convert mass to M_sun units
                 # m=temp.Mp*const.M_jup.value/const.M_sun.value,
                 m=Mp,
@@ -243,21 +274,41 @@ class StarryModel(PyMC3Model):
             planet.porb = temp.per
             # Setting prot here may not override a
             planet.prot = temp.per
-            if hasattr(temp, 'AmpCos1'):
-                planet.map[1, 0] = temp.AmpCos1
-            if hasattr(temp, 'AmpSin1'):
-                planet.map[1, 1] = temp.AmpSin1
-            if self.ydeg == 2:
-                if hasattr(temp, 'AmpCos2'):
-                    planet.map[2, 0] = temp.AmpCos2
-                if hasattr(temp, 'AmpSin2'):
-                    planet.map[2, 1] = temp.AmpSin2
-            # Offset is controlled by AmpSin1
+            if not self.linearized:
+                if hasattr(temp, 'AmpCos1'):
+                    planet.map[1, 0] = temp.AmpCos1
+                if hasattr(temp, 'AmpSin1'):
+                    planet.map[1, 1] = temp.AmpSin1
+                if self.ydeg == 2:
+                    if hasattr(temp, 'AmpCos2'):
+                        planet.map[2, 0] = temp.AmpCos2
+                    if hasattr(temp, 'AmpSin2'):
+                        planet.map[2, 1] = temp.AmpSin2
+            # Offset is controlled by Y11
             planet.theta0 = 180.0
-            planet.tref = 0
+            planet.t0 = temp.t0
 
             # Instantiate the system
             sys = starry.System(star, planet)
+
+            if self.linearized and self.ydeg > 0:
+                sys.set_data(self.flux/self.full_model.syseval(eval=True),
+                             C=self.scatter_array**2)
+                
+                # Reapply prior on map parameters
+                planet_mu = np.zeros(planet.map.Ny)
+                planet_mu[0] = 1e-4
+                planet_L = 1e-7*np.ones(planet.map.Ny)
+                planet.map.set_prior(mu=planet_mu, L=planet_L)
+
+                with self.full_model.model:
+                    import pymc3_ext as pmx
+                    x = pmx.eval_in_model(sys.solve(t=self.time)[0])
+                x[1:] /= x[0]
+                print(x)
+                planet.map.amp = x[0]
+                planet.map[1:, :] = x[1:]
+
             self.fit.systems.append(sys)
 
         return

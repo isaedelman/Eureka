@@ -537,14 +537,16 @@ def fit_channel(meta, lc, time, flux, chan, flux_err, eventlabel, params,
         modellist.append(t_GP)
 
     if 'starry' in meta.run_myfuncs:
-        # Only have that one model for starry
+        if not hasattr(meta, 'linearized'):
+            meta.linearized = False
         model = dm.CompositePyMC3Model(modellist, parameters=params,
                                        log=log, time=time,
                                        time_units=time_units,
                                        freenames=freenames,
                                        longparamlist=lc_model.longparamlist,
                                        nchan=lc_model.nchannel_fitted,
-                                       paramtitles=paramtitles)
+                                       paramtitles=paramtitles,
+                                       linearized=meta.linearized)
     else:
         model = m.CompositeModel(modellist, time=time,
                                  nchan=lc_model.nchannel_fitted)

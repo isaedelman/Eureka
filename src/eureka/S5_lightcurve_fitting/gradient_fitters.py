@@ -57,7 +57,14 @@ def exoplanetfitter(lc, model, meta, log, calling_function='exoplanet',
         map_soln = pmx.optimize(start=start)
 
     # Get the best fit params
-    fit_params = np.array([map_soln[name] for name in freenames])
+    fit_params = []
+    for name in freenames:
+        if model.linearized and name in ['fp', 'AmpCos1', 'AmpSin1',
+                                         'AmpCos2', 'AmpSin2']:
+            fit_params.append(np.nan)
+        else:
+            fit_params.append(map_soln[name])
+    fit_params = np.array(fit_params)
     model.update(fit_params)
 
     if "scatter_ppm" in freenames:
@@ -178,7 +185,16 @@ def nutsfitter(lc, model, meta, log, **kwargs):
                            chains=meta.chains, cores=meta.ncpu)
         print()
 
-    samples = np.hstack([trace[name].reshape(-1, 1) for name in freenames])
+    samples = np.zeros((meta.draws*meta.chains, 0))
+    for name in freenames:
+        if model.linearized and name in ['fp', 'AmpCos1', 'AmpSin1',
+                                         'AmpCos2', 'AmpSin2']:
+            samples = np.append(samples,
+                                np.nan*np.ones((meta.draws*meta.chains, 1)),
+                                axis=1)
+        else:
+            samples = np.append(samples, trace[name].reshape(-1, 1), axis=1)
+    samples = np.array(samples)
 
     # Record median + percentiles
     q = np.percentile(samples, [16, 50, 84], axis=0)

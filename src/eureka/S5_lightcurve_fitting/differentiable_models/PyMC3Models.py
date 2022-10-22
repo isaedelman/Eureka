@@ -172,7 +172,7 @@ class PyMC3Model:
         for val, key in zip(newparams, self.freenames):
             setattr(self.fit, key, val)
     
-    def setup(self):
+    def setup(self, **kwargs):
         """A placeholder function to do any additional setup.
         """
         return
@@ -249,6 +249,9 @@ class CompositePyMC3Model(PyMC3Model):
         # Inherit from PyMC3Model class
         super().__init__(**kwargs)
 
+        if not hasattr(self, 'linearized'):
+            self.linearized = False
+
         # Setup PyMC3 model
         self.model = pm.Model()
 
@@ -261,6 +264,9 @@ class CompositePyMC3Model(PyMC3Model):
         # Setup PyMC3 model parameters
         with self.model:
             for parname in self.paramtitles:
+                if self.linearized and parname in ['fp', 'AmpCos1', 'AmpSin1',
+                                                   'AmpCos2', 'AmpSin2']:
+                    continue
                 param = getattr(self.parameters, parname)
                 if param.ptype in ['independent', 'fixed']:
                     setattr(self.model, parname, param.value)
@@ -352,17 +358,32 @@ class CompositePyMC3Model(PyMC3Model):
                 # Not fitting the noise level
                 self.scatter_array = self.lc_unc
 
+            starry_component = None
             for component in self.components:
                 # Do any one-time setup needed after model initialization and
                 # before evaluating the model
-                component.setup()
+                if component.name == 'starry':
+                    # This needs to be run last for linearized models
+                    starry_component = component
+                    continue
+                else:
+                    component.setup(flux=flux, time=time,
+                                    scatter_array=self.scatter_array,
+                                    full_model=self)
+            
+            if starry_component is not None:
+                starry_component.setup(flux=flux, time=time,
+                                       scatter_array=self.scatter_array,
+                                       full_model=self)
 
             # This is how we tell pymc3 about our observations;
             # we are assuming they are normally distributed about
             # the true model. This line effectively defines our
             # likelihood function.
-            pm.Normal("obs", mu=self.eval(eval=False), sd=self.scatter_array,
-                      observed=self.flux)
+            if not self.linearized:
+                pm.Normal("obs", mu=self.eval(eval=False),
+                          sd=self.scatter_array,
+                          observed=self.flux)
 
     def eval(self, eval=True, channel=None, **kwargs):
         """Evaluate the model components.
@@ -459,5 +480,13 @@ class CompositePyMC3Model(PyMC3Model):
             Additional parameters to pass to
             eureka.S5_lightcurve_fitting.models.Model.update().
         """
+        starry_component = None
         for component in self.components:
-            component.update(newparams, **kwargs)
+            if component.name == 'starry':
+                starry_component = component
+                continue
+            else:
+                component.update(newparams, **kwargs)
+        
+        if starry_component is not None:
+            starry_component.update(newparams, **kwargs)
